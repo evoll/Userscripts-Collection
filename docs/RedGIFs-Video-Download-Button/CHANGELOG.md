@@ -1,5 +1,9 @@
 # Changelog
 
+## [2.6.2] - 2026-08-09
+- **Core Changes**
+  - [Metadata] Temporarily worked around missing filename dates caused by corrupted date-time strings from RedGIFs servers (e.g., `%2026-%08-%08UTC%21:%Aug:%th.0000`). Restored dates now fall back to `YYYYMMDD_000000` with the time fixed to `000000`.
+
 ## [2.6.1] - 2026-07-14
 - **Core Changes**
   - [Download] Fixed a critical issue where clicking the download button on subsequent videos in scrolled feeds mistakenly targeted the first video on the page.

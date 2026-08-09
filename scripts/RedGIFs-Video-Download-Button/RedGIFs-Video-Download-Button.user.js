@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         RedGIFs Video Download Button
 // @namespace    https://github.com/p65536
-// @version      2.6.1
+// @version      2.6.2
 // @license      MIT
 // @description  Adds a download button (for one-click HD downloads) and an "Open in New Tab" button to each video on the RedGIFs site.
 // @icon         https://www.redgifs.com/favicon.ico
@@ -1849,13 +1849,27 @@ background-color: #c00;
           const text = script.textContent;
           if (!text) continue;
           const data = JSON.parse(text);
+
+          const parseDateString = (dateStr) => {
+            if (typeof dateStr !== 'string') return undefined;
+            let date = new Date(dateStr);
+            if (isNaN(date.getTime())) {
+              // Strip percent signs to handle corrupted server date strings like "%2026-%08-%08..."
+              const cleanedStr = dateStr.replaceAll('%', '');
+              const match = cleanedStr.match(/(\d{4})-(\d{2})-(\d{2})/);
+              if (match) {
+                const [, year, month, day] = match;
+                date = new Date(`${year}-${month}-${day}T00:00:00`);
+              }
+            }
+            return !isNaN(date.getTime()) ? Math.floor(date.getTime() / 1000) : undefined;
+          };
+
           if (data.video && data.video.uploadDate) {
-            const date = new Date(data.video.uploadDate);
-            if (!isNaN(date.getTime())) createDate = Math.floor(date.getTime() / 1000);
+            createDate = parseDateString(data.video.uploadDate);
           }
-          if (data.datePublished) {
-            const date = new Date(data.datePublished);
-            if (!isNaN(date.getTime())) createDate = Math.floor(date.getTime() / 1000);
+          if (!createDate && data.datePublished) {
+            createDate = parseDateString(data.datePublished);
           }
           if (createDate) break;
         } catch (e) {}
