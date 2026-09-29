@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         RedGIFs Video Download Button
-// @namespace    https://github.com/p65536
-// @version      2.6.2
+// @namespace    https://github.com/evoll
+// @version      2.0.5
 // @license      MIT
 // @description  Adds a download button (for one-click HD downloads) and an "Open in New Tab" button to each video on the RedGIFs site.
 // @icon         https://www.redgifs.com/favicon.ico
@@ -10,8 +10,17 @@
 // @grant        GM.getValue
 // @grant        GM.setValue
 // @grant        GM.registerMenuCommand
+// @grant        GM.xmlHttpRequest
+// @grant        GM_xmlhttpRequest
+// @grant        GM.download
+// @grant        GM_download
+// @connect      media.redgifs.com
+// @connect      *.redgifs.com
+// @connect      *
 // @run-at       document-start
 // @noframes
+// @downloadURL https://update.greasyfork.org/scripts/
+// @updateURL https://update.greasyfork.org/scripts/
 // ==/UserScript==
 
 (function () {
@@ -21,7 +30,7 @@
   // SECTION: Script-Specific Definitions
   // =================================================================================
 
-  const OWNERID = 'p65536';
+  const OWNERID = 'evoll';
   const APPID = 'rgvdb';
   const APPNAME = 'RedGIFs Video Download Button';
   const LOG_PREFIX = `[${APPID.toUpperCase()}]`;
@@ -88,6 +97,12 @@
     TOAST_FADE_OUT_DURATION: 300,
     ICON_REVERT_DELAY: 2000,
     CANCEL_LOCK_DURATION: 600, // (ms) Duration to lock download button to prevent mis-click cancel
+    NETWORK: {
+      MAX_RETRIES: 4,
+      INITIAL_RETRY_DELAY: 800,
+      MAX_RETRY_DELAY: 6000,
+      REQUEST_TIMEOUT: 45000,
+    },
     MAX_FILENAME_LENGTH: 150, // Maximum length for the generated filename
     CONTEXT_TYPE: {
       TILE: 'TILE',
@@ -240,6 +255,34 @@ place-items: center;
 background-color: #c00;
 }
 
+/* Controls for standalone /watch/<id> pages. These pages can lack .GifPreview entirely. */
+.${APPID}-watch-controls {
+position: fixed;
+display: flex;
+flex-direction: column;
+gap: 4px;
+z-index: 2147483000;
+pointer-events: auto;
+}
+.${APPID}-watch-controls .${APPID}-preview-open-btn,
+.${APPID}-watch-controls .${APPID}-preview-download-btn {
+position: relative;
+top: auto;
+right: auto;
+left: auto;
+bottom: auto;
+margin: 0;
+flex: 0 0 auto;
+}
+.${APPID}-watch-controls .${APPID}-preview-open-btn {
+width: 36px;
+height: 36px;
+}
+.${APPID}-watch-controls .${APPID}-preview-download-btn {
+width: 36px;
+height: 36px;
+}
+
 /* Spinner Animation */
 .${APPID}-spinner {
 animation: ${APPID}-spinner-rotate 1s linear infinite;
@@ -275,7 +318,7 @@ animation: ${APPID}-toast-fade-out 0.3s ease-in forwards;
 /* Mobile: Adjust button position to avoid overlapping native UI */
 .App.phone .${APPID}-preview-open-btn {
 /* Offset by toolbar height (assumed 56px) + 8px original top */
-top: 64px; 
+top: 64px;
 }
 .App.phone .${APPID}-preview-download-btn {
 /* Offset by toolbar height (assumed 56px) + 44px original top */
@@ -1672,7 +1715,7 @@ background-color: #c00;
   }
 
   // =================================================================================
-  // SECTION: MediaInfoManager – Extract media info from Page Metadata
+  // SECTION: MediaInfoManager ￢ﾀﾓ Extract media info from Page Metadata
   // Handles structural extraction from static metadata and JSON-LD.
   // Supports both high-resolution videos and image elements natively.
   // =================================================================================
@@ -1709,7 +1752,7 @@ background-color: #c00;
       // If not on watch page, fetch the watch page HTML and parse
       try {
         const watchUrl = `${CONSTANTS.WATCH_URL_BASE}${normalizedId}`;
-        const response = await fetch(watchUrl);
+        const response = await this._fetchWatchPageWithRetry(watchUrl);
         if (!response.ok) {
           throw new HttpError(response.status, `Failed to fetch watch page: ${response.status}`);
         }
@@ -1789,6 +1832,73 @@ background-color: #c00;
         Logger.error('MEDIA ERROR', LOG_STYLES.RED, `Failed to fetch media info for ${normalizedId}:`, error);
         return null;
       }
+    }
+
+    /**
+     * Fetches a watch page with retry/backoff.
+     * @private
+     */
+    async _fetchWatchPageWithRetry(url) {
+      const maxRetries = CONSTANTS.NETWORK.MAX_RETRIES;
+      let lastError = null;
+
+      for (let attempt = 0; attempt < maxRetries; attempt++) {
+        try {
+          const response = await fetch(url, {
+            cache: 'no-store',
+            credentials: 'same-origin',
+          });
+
+          if (
+            (response.status === 408 ||
+              response.status === 425 ||
+              response.status === 429 ||
+              response.status >= 500) &&
+            attempt < maxRetries - 1
+          ) {
+            const retryAfter = Number(response.headers.get('Retry-After'));
+            const delay = Number.isFinite(retryAfter) && retryAfter >= 0
+              ? Math.min(retryAfter * 1000, CONSTANTS.NETWORK.MAX_RETRY_DELAY)
+              : Math.min(
+                  CONSTANTS.NETWORK.INITIAL_RETRY_DELAY * 2 ** attempt,
+                  CONSTANTS.NETWORK.MAX_RETRY_DELAY
+                );
+
+            Logger.warn(
+              'NETWORK',
+              LOG_STYLES.YELLOW,
+              `Watch page returned HTTP ${response.status}; retry ${attempt + 1}/${maxRetries - 1} in ${delay} ms`
+            );
+
+            await new Promise((resolve) => setTimeout(resolve, delay));
+            continue;
+          }
+
+          return response;
+        } catch (error) {
+          lastError = error;
+
+          if (attempt >= maxRetries - 1) {
+            break;
+          }
+
+          const delay = Math.min(
+            CONSTANTS.NETWORK.INITIAL_RETRY_DELAY * 2 ** attempt,
+            CONSTANTS.NETWORK.MAX_RETRY_DELAY
+          );
+
+          Logger.warn(
+            'NETWORK',
+            LOG_STYLES.YELLOW,
+            `Watch page network error; retry ${attempt + 1}/${maxRetries - 1} in ${delay} ms`,
+            error
+          );
+
+          await new Promise((resolve) => setTimeout(resolve, delay));
+        }
+      }
+
+      throw lastError ?? new Error('Watch page request failed.');
     }
 
     /**
@@ -2075,7 +2185,11 @@ background-color: #c00;
           onStatusChange('ERROR');
         } else {
           Logger.error('DOWNLOAD', LOG_STYLES.RED, 'Download failed:', error);
-          onNotify('Download failed. (Network error?)', 'error');
+          const reason =
+            error instanceof Error && error.message
+              ? error.message
+              : 'Unknown network error';
+          onNotify(`Download failed: ${reason}`, 'error');
           onStatusChange('ERROR');
         }
       } finally {
@@ -2117,21 +2231,70 @@ background-color: #c00;
      */
     async _downloadFile(url, filename, signal) {
       const config = this.configManager.get();
-      const response = await fetch(url, { signal });
-      if (!response.ok) {
-        throw new HttpError(response.status, `Server responded with ${response.status}`);
+
+      Logger.log('DOWNLOAD', LOG_STYLES.BLUE, 'Downloading media:', url);
+
+      // Prefer the userscript manager's native download facility.
+      // Some RedGIFs CDN objects can be played by the browser but reject
+      // XMLHttpRequest/fetch requests. GM_download downloads the URL directly
+      // and therefore avoids the failing XHR -> Blob path.
+      try {
+        await this._downloadWithGMDownload(url, filename, signal);
+        Logger.log('DOWNLOAD', LOG_STYLES.GREEN, `Downloaded ${filename} via GM_download`);
+        return;
+      } catch (directError) {
+        if (directError?.name === 'AbortError') throw directError;
+        Logger.warn(
+          'DOWNLOAD',
+          LOG_STYLES.YELLOW,
+          'GM_download failed; trying GM.xmlHttpRequest/blob fallback:',
+          directError
+        );
       }
 
-      const blob = await response.blob();
+      let blob;
+      try {
+        blob = await this._downloadBlobWithGM(url, signal);
+      } catch (gmError) {
+        if (gmError?.name === 'AbortError') throw gmError;
+
+        Logger.warn(
+          'DOWNLOAD',
+          LOG_STYLES.YELLOW,
+          'GM.xmlHttpRequest failed; trying native fetch as fallback:',
+          gmError
+        );
+
+        // Keep a native fetch fallback for browsers/userscript managers that
+        // do not expose GM.xmlHttpRequest correctly.
+        const response = await this._fetchWithRetry(url, {
+          signal,
+          cache: 'no-store',
+          credentials: 'omit',
+        });
+
+        if (!response.ok) {
+          throw new HttpError(response.status, `Server responded with ${response.status}`);
+        }
+
+        blob = await response.blob();
+      }
+
+      if (!(blob instanceof Blob) || blob.size === 0) {
+        throw new Error('The server returned an empty media file.');
+      }
+
       let objectUrl = null;
       let link = null;
       try {
         objectUrl = URL.createObjectURL(blob);
         this.activeBlobUrls.add(objectUrl);
+
         link = h('a', {
           href: objectUrl,
           download: filename,
         });
+
         if (link instanceof HTMLElement) {
           document.body.appendChild(link);
           link.click();
@@ -2140,6 +2303,7 @@ background-color: #c00;
         if (link instanceof HTMLElement) {
           link.remove();
         }
+
         if (objectUrl) {
           const urlToRevoke = objectUrl;
           setTimeout(() => {
@@ -2150,6 +2314,340 @@ background-color: #c00;
           }, config.download.blobRevokeTime);
         }
       }
+    }
+
+    /**
+     * Downloads directly through Tampermonkey/Violentmonkey's download API.
+     * This is intentionally preferred over XHR because some RedGIFs CDN
+     * objects reject programmatic HTTP requests while remaining playable by
+     * the browser's media loader.
+     * @private
+     */
+    _downloadWithGMDownload(url, filename, signal) {
+      const directDownload =
+        (typeof GM !== 'undefined' && typeof GM.download === 'function' && GM.download.bind(GM)) ||
+        (typeof GM_download === 'function' && GM_download);
+
+      if (!directDownload) {
+        return Promise.reject(new Error('GM.download / GM_download is not available.'));
+      }
+
+      return new Promise((resolve, reject) => {
+        let settled = false;
+        let downloadHandle = null;
+
+        const cleanup = () => {
+          signal?.removeEventListener('abort', onAbort);
+        };
+
+        const finishResolve = () => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          resolve();
+        };
+
+        const finishReject = (error) => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          reject(error instanceof Error ? error : new Error(String(error || 'GM download failed.')));
+        };
+
+        const onAbort = () => {
+          try {
+            downloadHandle?.abort?.();
+          } catch {}
+          finishReject(new DOMException('The operation was aborted.', 'AbortError'));
+        };
+
+        if (signal?.aborted) {
+          finishReject(new DOMException('The operation was aborted.', 'AbortError'));
+          return;
+        }
+
+        signal?.addEventListener('abort', onAbort, { once: true });
+
+        const details = {
+          url,
+          name: filename,
+          saveAs: false,
+          anonymous: false,
+          conflictAction: 'uniquify',
+          headers: {
+            Accept: 'video/mp4,video/*;q=0.9,*/*;q=0.8',
+            Referer: 'https://www.redgifs.com/',
+          },
+          onload: finishResolve,
+          onerror: (error) => {
+            const reason = error?.error || error?.details || error?.statusText || 'unknown';
+            finishReject(new Error(`GM download failed: ${reason}`));
+          },
+          ontimeout: () => finishReject(new Error('GM download timed out.')),
+          onabort: () => finishReject(new DOMException('The operation was aborted.', 'AbortError')),
+        };
+
+        try {
+          downloadHandle = directDownload(details);
+
+          // Promise-based GM.download resolves when the browser download is complete.
+          if (downloadHandle && typeof downloadHandle.then === 'function') {
+            downloadHandle.then(finishResolve).catch(finishReject);
+          }
+        } catch (error) {
+          finishReject(error);
+        }
+      });
+    }
+
+    /**
+     * Performs a GET request with retry/backoff for transient network errors.
+     * @private
+     */
+    async _fetchWithRetry(url, options = {}) {
+      const network = CONSTANTS.NETWORK;
+      let lastError = null;
+
+      for (let attempt = 0; attempt < network.MAX_RETRIES; attempt++) {
+        try {
+          if (options.signal?.aborted) {
+            throw new DOMException('The operation was aborted.', 'AbortError');
+          }
+
+          const response = await fetch(url, {
+            ...options,
+            signal: options.signal,
+          });
+
+          // Retry only transient server responses.
+          if (
+            (response.status === 408 ||
+              response.status === 425 ||
+              response.status === 429 ||
+              response.status >= 500) &&
+            attempt < network.MAX_RETRIES - 1
+          ) {
+            const retryAfter = Number(response.headers.get('Retry-After'));
+            const delay = Number.isFinite(retryAfter) && retryAfter >= 0
+              ? Math.min(retryAfter * 1000, network.MAX_RETRY_DELAY)
+              : Math.min(
+                  network.INITIAL_RETRY_DELAY * 2 ** attempt,
+                  network.MAX_RETRY_DELAY
+                );
+
+            Logger.warn(
+              'NETWORK',
+              LOG_STYLES.YELLOW,
+              `Transient HTTP ${response.status}; retry ${attempt + 1}/${network.MAX_RETRIES - 1} in ${delay} ms`
+            );
+
+            await this._sleep(delay, options.signal);
+            continue;
+          }
+
+          return response;
+        } catch (error) {
+          if (error?.name === 'AbortError') {
+            throw error;
+          }
+
+          lastError = error;
+
+          if (attempt >= network.MAX_RETRIES - 1) {
+            break;
+          }
+
+          const delay = Math.min(
+            network.INITIAL_RETRY_DELAY * 2 ** attempt,
+            network.MAX_RETRY_DELAY
+          );
+
+          Logger.warn(
+            'NETWORK',
+            LOG_STYLES.YELLOW,
+            `Network error; retry ${attempt + 1}/${network.MAX_RETRIES - 1} in ${delay} ms`,
+            error
+          );
+
+          await this._sleep(delay, options.signal);
+        }
+      }
+
+      throw lastError ?? new Error('Network request failed.');
+    }
+
+    /**
+     * @private
+     */
+    _sleep(ms, signal) {
+      return new Promise((resolve, reject) => {
+        if (signal?.aborted) {
+          reject(new DOMException('The operation was aborted.', 'AbortError'));
+          return;
+        }
+
+        let timer = null;
+
+        const onAbort = () => {
+          if (timer !== null) clearTimeout(timer);
+          signal?.removeEventListener('abort', onAbort);
+          reject(new DOMException('The operation was aborted.', 'AbortError'));
+        };
+
+        timer = setTimeout(() => {
+          signal?.removeEventListener('abort', onAbort);
+          resolve();
+        }, ms);
+
+        signal?.addEventListener('abort', onAbort, { once: true });
+      });
+    }
+
+    /**
+     * Downloads a media file through the userscript manager.
+     * This avoids CORS failures against the RedGIFs CDN.
+     * @private
+     */
+    async _downloadBlobWithGM(url, signal) {
+      const gmRequest =
+        (typeof GM !== 'undefined' && typeof GM.xmlHttpRequest === 'function' && GM.xmlHttpRequest.bind(GM)) ||
+        (typeof GM_xmlhttpRequest === 'function' && GM_xmlhttpRequest);
+
+      if (!gmRequest) {
+        throw new Error('GM.xmlHttpRequest is not available.');
+      }
+
+      const network = CONSTANTS.NETWORK;
+
+      for (let attempt = 0; attempt < network.MAX_RETRIES; attempt++) {
+        if (signal?.aborted) {
+          throw new DOMException('The operation was aborted.', 'AbortError');
+        }
+
+        try {
+          return await new Promise((resolve, reject) => {
+            let settled = false;
+            let timeoutId = null;
+            let request = null;
+
+            const cleanup = () => {
+              if (timeoutId !== null) clearTimeout(timeoutId);
+              signal?.removeEventListener('abort', onAbort);
+            };
+
+            const finishResolve = (value) => {
+              if (settled) return;
+              settled = true;
+              cleanup();
+              resolve(value);
+            };
+
+            const finishReject = (error) => {
+              if (settled) return;
+              settled = true;
+              cleanup();
+              reject(error);
+            };
+
+            const onAbort = () => {
+              try {
+                request?.abort();
+              } catch {}
+              finishReject(new DOMException('The operation was aborted.', 'AbortError'));
+            };
+
+            signal?.addEventListener('abort', onAbort, { once: true });
+
+            timeoutId = setTimeout(() => {
+              try {
+                request?.abort();
+              } catch {}
+              finishReject(new Error(`Request timeout after ${network.REQUEST_TIMEOUT} ms`));
+            }, network.REQUEST_TIMEOUT);
+
+            try {
+              request = gmRequest({
+                method: 'GET',
+                url,
+                responseType: 'arraybuffer',
+                anonymous: false,
+                headers: {
+                  Accept: 'video/mp4,video/*;q=0.9,*/*;q=0.8',
+                  Referer: 'https://www.redgifs.com/',
+                },
+                onload: (response) => {
+                  const status = Number(response.status) || 0;
+
+                  if (status >= 200 && status < 300) {
+                    if (response.response instanceof Blob) {
+                      finishResolve(response.response);
+                    } else if (response.response instanceof ArrayBuffer) {
+                      const contentType =
+                        response.responseHeaders?.match(/(?:^|\r?\n)content-type:\s*([^\r\n]+)/i)?.[1]?.trim() ||
+                        'video/mp4';
+                      finishResolve(new Blob([response.response], { type: contentType }));
+                    } else {
+                      finishReject(new Error('GM request did not return binary media data.'));
+                    }
+                    return;
+                  }
+
+                  const error = new HttpError(
+                    status,
+                    `Server responded with ${status || 'unknown status'}`
+                  );
+
+                  // These statuses are handled by the retry loop below.
+                  finishReject(error);
+                },
+                onerror: (error) => {
+                  const detail = error?.error || error?.statusText || error?.status || 'unknown';
+                  finishReject(new Error(`GM network error: ${detail}`, { cause: error }));
+                },
+                ontimeout: () => {
+                  finishReject(new Error('GM request timed out.'));
+                },
+                onabort: () => {
+                  finishReject(new DOMException('The operation was aborted.', 'AbortError'));
+                },
+              });
+            } catch (error) {
+              finishReject(error);
+            }
+          });
+        } catch (error) {
+          if (error?.name === 'AbortError') {
+            throw error;
+          }
+
+          const status = error instanceof HttpError ? error.status : 0;
+          const retryable =
+            !status ||
+            status === 408 ||
+            status === 425 ||
+            status === 429 ||
+            status >= 500;
+
+          if (!retryable || attempt >= network.MAX_RETRIES - 1) {
+            throw error;
+          }
+
+          const delay = Math.min(
+            network.INITIAL_RETRY_DELAY * 2 ** attempt,
+            network.MAX_RETRY_DELAY
+          );
+
+          Logger.warn(
+            'NETWORK',
+            LOG_STYLES.YELLOW,
+            `Media request failed${status ? ` (HTTP ${status})` : ''}; retry ${attempt + 1}/${network.MAX_RETRIES - 1} in ${delay} ms`
+          );
+
+          await this._sleep(delay, signal);
+        }
+      }
+
+      throw new Error('Media download failed after all retries.');
     }
   }
 
@@ -2349,6 +2847,10 @@ pointer-events: auto !important;
      * @param {(e: MouseEvent) => void} options.clickHandler - The function to call on click.
      */
     createButton({ parentElement, className, title, iconName, clickHandler }) {
+      // React/SPA pages may detach a matched element between observation and callback.
+      if (!(parentElement instanceof HTMLElement) || !parentElement.isConnected) {
+        return;
+      }
       // Prevent duplicate buttons
       if (parentElement.querySelector(`.${className}`)) {
         return;
@@ -2396,6 +2898,7 @@ pointer-events: auto !important;
      * @param {'IDLE'|'LOADING_LOCKED'|'LOADING_CANCELLABLE'|'SUCCESS'|'ERROR'} state The new state.
      */
     updateButtonState(button, state) {
+      if (!(button instanceof HTMLButtonElement) || !button.isConnected) return;
       const stateMap = {
         IDLE: { icon: 'DOWNLOAD', disabled: false, title: 'Download HD Video' },
         LOADING_LOCKED: { icon: 'SPINNER', disabled: true, title: 'Downloading... (Please wait)' }, // Cancel lock
@@ -2428,6 +2931,10 @@ pointer-events: auto !important;
      * @param {(e: MouseEvent) => void} [options.clickHandler] - Optional click handler (e.g., for stopPropagation).
      */
     createLinkButton({ parentElement, className, title, iconName, href, clickHandler }) {
+      // React/SPA pages may detach a matched element between observation and callback.
+      if (!(parentElement instanceof HTMLElement) || !parentElement.isConnected) {
+        return;
+      }
       // Prevent duplicate buttons
       if (parentElement.querySelector(`.${className}`)) {
         return;
@@ -2562,26 +3069,17 @@ visibility: hidden !important;
    * @property {WeakMap<CSSRule, string>} ruleSelectors
    */
   class Sentinel {
-    static MAX_POLLS = 60;
-    static POLL_INTERVAL = 50;
-
     /**
-     * @param {string} prefix - A unique identifier for this Sentinel instance to avoid CSS conflicts. Required.
+     * DOM observer used instead of the former CSS animation sentinel.
+     * The animation-based implementation dispatched synthetic animationstart
+     * events on RedGIFs' own React-managed elements, which could collide with
+     * site listeners during rapid player re-renders.
      */
     constructor(prefix) {
       if (!prefix) {
-        throw new Error('[Sentinel] "prefix" argument is required to avoid CSS conflicts.');
+        throw new Error('[Sentinel] "prefix" argument is required.');
       }
 
-      // Validate prefix for CSS compatibility
-      // 1. Must contain only alphanumeric characters, hyphens, or underscores.
-      // 2. Cannot start with a digit.
-      // 3. Cannot start with a hyphen followed by a digit.
-      if (!/^[a-zA-Z0-9_-]+$/.test(prefix) || /^[0-9]|^-[0-9]/.test(prefix)) {
-        throw new Error(`[Sentinel] Prefix "${prefix}" is invalid. It must contain only alphanumeric characters, hyphens, or underscores, and cannot start with a digit or a hyphen followed by a digit.`);
-      }
-
-      /** @type {Window & { __global_sentinel_instances__?: Record<string, Sentinel> }} */
       const globalScope = window;
       globalScope.__global_sentinel_instances__ ??= {};
       if (globalScope.__global_sentinel_instances__[prefix]) {
@@ -2590,343 +3088,139 @@ visibility: hidden !important;
 
       this.prefix = prefix;
       this.isSuspended = false;
-
-      // Use a unique, prefixed animation name shared by all scripts in a project.
-      this.animationName = `${prefix}-global-sentinel-animation`;
-      this.styleId = `${prefix}-sentinel-global-rules`; // A single, unified style element
       this.listeners = new Map();
-      this.rules = new Set(); // Tracks all active selectors
-      this.styleElement = null; // Holds the reference to the single style element
-      this.sheet = null; // Cache the CSSStyleSheet reference
-      /** @type {WeakMap<CSSRule, string>} */
-      this.ruleSelectors = new WeakMap(); // Tracks selector strings associated with CSSRule objects
-      /** @type {Map<string, string>} */
-      this.normalizedSelectors = new Map(); // Maps original selectors to browser-normalized selectors
+      this.rules = new Set();
+      this._scanScheduled = false;
 
-      this._boundHandleAnimationStart = this._handleAnimationStart.bind(this);
+      this._observer = new MutationObserver((mutations) => {
+        if (this.isSuspended || !mutations.length) return;
+        this._scheduleScan(mutations);
+      });
 
-      this._injectStyleElement();
-      document.addEventListener('animationstart', this._boundHandleAnimationStart, true);
+      const target = document.documentElement || document;
+      // RedGIFs may create the player/container first and attach its media ID
+      // (data-feed-item-id / id / href) a little later. Observe both DOM insertions
+      // and relevant attribute changes so we don't miss those cards.
+      this._observer.observe(target, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        attributeFilter: ['data-feed-item-id', 'id', 'href', 'src', 'class'],
+      });
 
       globalScope.__global_sentinel_instances__[prefix] = this;
     }
 
-    _injectStyleElement() {
-      // Ensure the style element is injected only once per project prefix.
-      this.styleElement = document.getElementById(this.styleId);
+    _scheduleScan(mutations) {
+      if (this._scanScheduled) return;
+      this._scanScheduled = true;
 
-      if (this.styleElement instanceof HTMLStyleElement) {
-        this.styleElement.disabled = this.isSuspended;
-        this._waitForStylesheet();
-        return;
-      }
+      const run = () => {
+        this._scanScheduled = false;
+        if (this.isSuspended) return;
 
-      // Create empty style element
-      this.styleElement = document.createElement('style');
-      this.styleElement.id = this.styleId;
-
-      // CSP Fix: Try to fetch a valid nonce from existing scripts/styles
-      // "nonce" property exists on HTMLScriptElement/HTMLStyleElement, not basic Element.
-      let nonce;
-
-      // 1. Try to get nonce from scripts collection
-      const scripts = document.scripts;
-      for (let i = 0; i < scripts.length; i++) {
-        if (scripts[i].nonce) {
-          nonce = scripts[i].nonce;
-          break;
-        }
-      }
-
-      // 2. Fallback: Using querySelector (content attribute)
-      if (!nonce) {
-        const style = document.querySelector('style[nonce]');
-        const script = document.querySelector('script[nonce]');
-
-        if (style instanceof HTMLStyleElement && style.nonce) {
-          nonce = style.nonce;
-        } else if (script instanceof HTMLScriptElement && script.nonce) {
-          nonce = script.nonce;
-        }
-      }
-
-      if (nonce) {
-        this.styleElement.nonce = nonce;
-      }
-
-      if (this.styleElement instanceof HTMLStyleElement) {
-        this.styleElement.disabled = this.isSuspended;
-      }
-
-      // Try to inject immediately.
-      // If the document is not yet ready (e.g. extremely early document-start), wait for the root element.
-      const target = document.head || document.documentElement;
-
-      if (target) {
-        target.appendChild(this.styleElement);
-        this._waitForStylesheet();
-      } else {
-        const initObserver = new MutationObserver(() => {
-          const retryTarget = document.head || document.documentElement;
-          if (retryTarget) {
-            initObserver.disconnect();
-
-            retryTarget.appendChild(this.styleElement);
-            this._waitForStylesheet();
+        const candidates = new Set();
+        for (const mutation of mutations) {
+          // For attribute changes, the target itself is the candidate.
+          if (mutation.type === 'attributes' && mutation.target instanceof Element) {
+            candidates.add(mutation.target);
+            // The target may be a child (e.g. <video>) whose containing card is
+            // what the registered selector actually matches.
+            let ancestor = mutation.target.parentElement;
+            for (let depth = 0; ancestor && depth < 6; depth++, ancestor = ancestor.parentElement) {
+              candidates.add(ancestor);
+            }
           }
-        });
-        initObserver.observe(document, { childList: true });
-      }
-    }
 
-    /**
-     * Ensures the style element is connected to the DOM and restores rules if it was removed.
-     */
-    _ensureStyleGuard() {
-      // Lazy Recovery: If the style element is connected but the stylesheet reference (this.sheet) was missed due to a timeout caused by a long task, recover it immediately here.
-      if (this.styleElement instanceof HTMLStyleElement && this.styleElement.isConnected && !this.sheet && this.styleElement.sheet) {
-        this._syncStylesheetRules();
-      }
-
-      if (this.styleElement && !this.styleElement.isConnected) {
-        const target = document.head || document.documentElement;
-        if (target) {
-          this.sheet = null; // Clear stale stylesheet reference before reconnecting
-          target.appendChild(this.styleElement);
-          this._waitForStylesheet();
+          for (const node of mutation.addedNodes) {
+            if (node instanceof Element) {
+              candidates.add(node);
+              for (const selector of this.rules) {
+                try {
+                  node.querySelectorAll(selector).forEach((el) => candidates.add(el));
+                } catch (e) {
+                  console.debug(`[Sentinel] Selector scan failed for "${selector}":`, e);
+                }
+              }
+            }
+          }
         }
-      }
-    }
 
-    /**
-     * Periodically checks for stylesheet availability and triggers full synchronization.
-     * @private
-     */
-    _waitForStylesheet() {
-      if (!(this.styleElement instanceof HTMLStyleElement) || !this.styleElement.isConnected) return;
-
-      const styleNode = this.styleElement;
-      let pollCount = 0;
-
-      const poll = () => {
-        if (!styleNode.isConnected) return;
-        if (styleNode.sheet) {
-          this._syncStylesheetRules();
-        } else if (pollCount < Sentinel.MAX_POLLS) {
-          pollCount++;
-          console.debug(`[Sentinel] Polling sheet (Attempt ${pollCount}/${Sentinel.MAX_POLLS}). requestAnimationFrame check was insufficient.`);
-          setTimeout(poll, Sentinel.POLL_INTERVAL);
-        } else {
-          // Calculate timeout in seconds dynamically based on constants
-          const timeoutSeconds = (Sentinel.MAX_POLLS * Sentinel.POLL_INTERVAL) / 1000;
-          console.error(`[Sentinel] Polling sheet timed out after ${timeoutSeconds} seconds.`);
+        for (const element of candidates) {
+          this._dispatch(element);
         }
       };
 
-      if (styleNode.sheet) {
-        this._syncStylesheetRules();
+      if (typeof requestAnimationFrame === 'function') {
+        requestAnimationFrame(run);
       } else {
-        requestAnimationFrame(() => {
-          if (!styleNode.isConnected) return;
-          if (styleNode.sheet) {
-            this._syncStylesheetRules();
-          } else {
-            setTimeout(poll, Sentinel.POLL_INTERVAL);
+        setTimeout(run, 0);
+      }
+    }
+
+    _dispatch(target) {
+      if (!(target instanceof Element) || !target.isConnected) return;
+
+      for (const [selector, callbacks] of this.listeners.entries()) {
+        let matches = false;
+        try {
+          matches = target.matches(selector);
+        } catch (e) {
+          console.debug(`[Sentinel] Invalid selector "${selector}":`, e);
+        }
+        if (!matches) continue;
+
+        [...callbacks].forEach((cb) => {
+          try {
+            if (target.isConnected) cb(target);
+          } catch (e) {
+            console.error(`[Sentinel] Listener error for selector "${selector}":`, e);
           }
         });
       }
     }
 
-    /**
-     * Synchronizes all active rules directly onto the connected stylesheet.
-     * @private
-     */
-    _syncStylesheetRules() {
-      if (!(this.styleElement instanceof HTMLStyleElement) || !this.styleElement.isConnected || !this.styleElement.sheet) return;
-
-      this.styleElement.disabled = this.isSuspended;
-      this.sheet = this.styleElement.sheet;
-
+    _scanExisting(selector) {
       try {
-        // Non-destructive cleanup: scan and remove only rules belonging to this instance's active selectors
-        for (let i = this.sheet.cssRules.length - 1; i >= 0; i--) {
-          const rule = this.sheet.cssRules[i];
-          const recordedSelector = this.ruleSelectors.get(rule);
-          if (this.rules.has(recordedSelector) || (rule instanceof CSSStyleRule && (this.rules.has(rule.selectorText) || [...this.rules].some((sel) => rule.selectorText === this.normalizedSelectors.get(sel))))) {
-            this.sheet.deleteRule(i);
-          }
-        }
-
-        // Non-destructive keyframes validation
-        this._ensureKeyframesRule();
+        document.querySelectorAll(selector).forEach((element) => this._dispatch(element));
       } catch (e) {
-        console.error('[Sentinel] Failed to clear or restore base rules:', e);
-      }
-
-      this.rules.forEach((selector) => {
-        const success = this._insertRule(selector);
-        if (!success) {
-          // Rollback invalid selector to prevent infinite error loops on subsequent syncs
-          this.rules.delete(selector);
-          this.listeners.delete(selector);
-        }
-      });
-    }
-
-    /**
-     * Ensures the shared keyframes rule exists in the stylesheet.
-     */
-    _ensureKeyframesRule() {
-      let hasKeyframes = false;
-      for (let i = 0; i < this.sheet.cssRules.length; i++) {
-        const rule = this.sheet.cssRules[i];
-        if (rule instanceof CSSKeyframesRule && rule.name === this.animationName) {
-          hasKeyframes = true;
-          break;
-        }
-      }
-      if (!hasKeyframes) {
-        const keyframes = `@keyframes ${this.animationName} { from { outline: 1px solid transparent; } to { outline: 0px solid transparent; } }`;
-        this.sheet.insertRule(keyframes, 0);
+        console.debug(`[Sentinel] Initial scan failed for "${selector}":`, e);
       }
     }
 
-    /**
-     * Helper to insert a single rule into the stylesheet
-     * @param {string} selector
-     * @returns {boolean} True if insertion was successful, false otherwise
-     */
-    _insertRule(selector) {
-      try {
-        const index = this.sheet.cssRules.length;
-        const ruleText = `${selector} { animation-duration: 0.001s; animation-name: ${this.animationName}; }`;
-        this.sheet.insertRule(ruleText, index);
-        // Associate the inserted rule with the selector via WeakMap for safer removal later.
-        // This mimics sentinel.js behavior to handle index shifts and selector normalization.
-        const insertedRule = this.sheet.cssRules[index];
-        if (insertedRule) {
-          this.ruleSelectors.set(insertedRule, selector);
-          if (insertedRule instanceof CSSStyleRule) {
-            this.normalizedSelectors.set(selector, insertedRule.selectorText);
-          }
-        }
-        return true;
-      } catch (e) {
-        console.error(`[Sentinel] Rule insertion failed for selector "${selector}". The listener has been rejected and removed:`, e);
-        return false;
-      }
-    }
-
-    _handleAnimationStart(event) {
-      if (this.isSuspended) return;
-
-      // Check if the animation is the one we're listening for.
-      if (event.animationName !== this.animationName) return;
-
-      const target = event.target;
-      if (!(target instanceof Element)) {
-        return;
-      }
-
-      // Check if the target element matches any of this instance's selectors.
-      for (const [selector, callbacks] of this.listeners.entries()) {
-        if (target.matches(selector)) {
-          // Use a copy of the callbacks Set in case a callback removes itself.
-          [...callbacks].forEach((cb) => {
-            try {
-              cb(target);
-            } catch (e) {
-              console.error(`[Sentinel] Listener error for selector "${selector}":`, e);
-            }
-          });
-        }
-      }
-    }
-
-    /**
-     * @param {string} selector
-     * @param {(element: Element) => void} callback
-     */
     on(selector, callback) {
-      this._ensureStyleGuard();
-
-      // Add callback to listeners
-
       if (!this.listeners.has(selector)) {
         this.listeners.set(selector, new Set());
       }
       this.listeners.get(selector).add(callback);
-      // If selector is already registered in rules, do nothing
-      if (this.rules.has(selector)) return;
       this.rules.add(selector);
 
-      // Apply rule
-      if (this.sheet) {
-        const success = this._insertRule(selector);
-        if (!success) {
-          // Rollback on immediate insertion failure
-          this.listeners.delete(selector);
-          this.rules.delete(selector);
-        }
-      }
+      // Process elements that already exist. This replaces the old animation
+      // rule, which also had the undesirable side effect of firing animationstart.
+      this._scanExisting(selector);
     }
 
-    /**
-     * @param {string} selector
-     * @param {(element: Element) => void} callback
-     */
     off(selector, callback) {
       const callbacks = this.listeners.get(selector);
       if (!callbacks) return;
 
-      const wasDeleted = callbacks.delete(callback);
-      if (!wasDeleted) {
-        return;
-        // Callback not found, do nothing.
-      }
-
+      callbacks.delete(callback);
       if (callbacks.size === 0) {
-        // Remove listener and rule
         this.listeners.delete(selector);
         this.rules.delete(selector);
-        this.normalizedSelectors.delete(selector);
-
-        if (this.sheet) {
-          // Iterate backwards to avoid index shifting issues during deletion
-          for (let i = this.sheet.cssRules.length - 1; i >= 0; i--) {
-            const rule = this.sheet.cssRules[i];
-            // Check for recorded selector via WeakMap or fallback to selectorText match
-            const recordedSelector = this.ruleSelectors.get(rule);
-            if (recordedSelector === selector || (rule instanceof CSSStyleRule && (rule.selectorText === selector || rule.selectorText === this.normalizedSelectors.get(selector)))) {
-              try {
-                this.sheet.deleteRule(i);
-              } catch (e) {
-                console.error(`[Sentinel] Failed to delete rule for selector "${selector}":`, e);
-              }
-              // We assume one rule per selector, so we can break after deletion
-              break;
-            }
-          }
-        }
       }
     }
 
     suspend() {
-      if (this.isSuspended) return;
       this.isSuspended = true;
-      if (this.styleElement instanceof HTMLStyleElement) {
-        this.styleElement.disabled = true;
-      }
-      console.debug('[Sentinel] Suspended.');
     }
 
     resume() {
       if (!this.isSuspended) return;
       this.isSuspended = false;
-      if (this.styleElement instanceof HTMLStyleElement) {
-        this.styleElement.disabled = false;
+      for (const selector of this.rules) {
+        this._scanExisting(selector);
       }
-      console.debug('[Sentinel] Resumed.');
     }
   }
 
@@ -2993,29 +3287,65 @@ visibility: hidden !important;
       };
 
       // Shared ID extractor for dataset-based IDs
-      const getFeedId = (el) => {
-        // Ensure element is HTMLElement to access dataset
-        if (!(el instanceof HTMLElement)) return null;
+      const extractRedgifsId = (value) => {
+        if (!value) return null;
+        const text = String(value).trim();
+        if (!text || text.startsWith('blob:') || text.startsWith('data:')) return null;
 
-        // ID is in 'data-feed-item-id'
-        const feedId = el.dataset.feedItemId;
-        // Filter out non-video items (e.g. 'feed-module-...') and normalize to lowercase
-        if (feedId && !feedId.startsWith('feed-module-')) {
-          return feedId.toLowerCase();
-        }
-        // Fallback: Check for ID attribute if layout reverts or mixed
-        // Tile IDs were just the ID, Preview IDs were 'gif_ID'
-        if (el.id) {
-          const idPart = el.id.startsWith('gif_') ? el.id.split('_')[1] : el.id;
-          return idPart ? idPart.toLowerCase() : null;
-        }
+        // watch/<id> and ifr/<id> are the most reliable page-level identifiers.
+        const match = text.match(/redgifs\.com\/(?:watch|ifr)\/([^/?#&.]+)/i);
+        if (match?.[1]) return match[1].toLowerCase();
+
+        // Some media URLs contain the RedGIFs ID as the first path component.
+        const mediaMatch = text.match(/(?:thumbs2|media)\.redgifs\.com\/[^/]+\/([^/?#]+?)(?:-hd|-sd|-mobile|-silent)?\.(?:mp4|webm|jpg|jpeg|png|webp)(?:[?#].*)?$/i);
+        if (mediaMatch?.[1]) return mediaMatch[1].toLowerCase();
         return null;
       };
 
-      // Set up the listener using Sentinel.
-      // When Sentinel registers a new selector, it rewrites its stylesheet.
-      // This triggers the animationstart event for both elements
-      // that already exist in the DOM and elements added later.
+      const getFeedId = (el) => {
+        if (!(el instanceof HTMLElement)) return null;
+
+        // 1. Authoritative card identity.
+        const feedId = el.getAttribute('data-feed-item-id');
+        if (feedId && !feedId.startsWith('feed-module-')) {
+          return feedId.toLowerCase();
+        }
+
+        // 2. Legacy/alternate card IDs.
+        if (el.id) {
+          const idMatch = el.id.match(/^gif_(.+)$/i);
+          if (idMatch?.[1]) return idMatch[1].toLowerCase();
+          if (/^[a-z0-9]{5,}$/i.test(el.id)) return el.id.toLowerCase();
+        }
+
+        // 3. Watch/iframe links inside the card.
+        const link = el.matches('a[href]') ? el : el.querySelector('a[href*="redgifs.com/watch/"], a[href*="redgifs.com/ifr/"]');
+        const linkId = extractRedgifsId(link?.href || link?.getAttribute('href'));
+        if (linkId) return linkId;
+
+        // 4. Video/source URLs can identify cards whose React metadata arrives late.
+        const media = el.matches('video, source') ? el : el.querySelector('video[src], video source[src]');
+        const mediaId = extractRedgifsId(media?.currentSrc || media?.src || media?.getAttribute?.('src'));
+        if (mediaId) return mediaId;
+
+        // 5. Check a few ancestors; RedGIFs occasionally puts the identity on a wrapper.
+        let parent = el.parentElement;
+        for (let depth = 0; parent && depth < 5; depth++, parent = parent.parentElement) {
+          const parentFeedId = parent.getAttribute('data-feed-item-id');
+          if (parentFeedId && !parentFeedId.startsWith('feed-module-')) {
+            return parentFeedId.toLowerCase();
+          }
+          if (parent.id) {
+            const parentId = parent.id.match(/^gif_(.+)$/i)?.[1];
+            if (parentId) return parentId.toLowerCase();
+          }
+        }
+
+        return null;
+      };
+
+      // Set up the listeners using Sentinel. Sentinel observes both inserted nodes
+      // and late identity/URL attributes so dynamically hydrated cards are handled.
 
       // Setup observer for Tile Items (Grid View)
       registerObserver(CONSTANTS.TILE_ITEM_SELECTOR, (element) => {
@@ -3030,6 +3360,12 @@ visibility: hidden !important;
           this._onElementFound(element, getFeedId, CONSTANTS.CONTEXT_TYPE.PREVIEW);
         }
       });
+
+      // Standalone /watch/<id> pages need a dedicated path because they may not
+      // expose the card selectors used by the feed/grid UI.
+      if (/^\/watch\/[^/?#]+/i.test(window.location.pathname)) {
+        this._initWatchPage();
+      }
 
       Logger.log('INIT', LOG_STYLES.GREEN, 'Initialized and observing DOM for new content.');
     }
@@ -3047,10 +3383,21 @@ visibility: hidden !important;
       }
 
       const mediaId = idExtractor(element);
-      // Robust check: Ensure mediaId is truthy (not null, undefined, or empty string)
       if (mediaId) {
         this._addButtonsToElement(element, mediaId, type);
+        return;
       }
+
+      // React can populate the identity asynchronously after the container exists.
+      // Retry a few times without creating duplicate buttons.
+      const retryDelays = [100, 350, 1000, 2500];
+      retryDelays.forEach((delay) => {
+        setTimeout(() => {
+          if (!element.isConnected) return;
+          const retryId = idExtractor(element);
+          if (retryId) this._addButtonsToElement(element, retryId, type);
+        }, delay);
+      });
     }
 
     /**
@@ -3122,6 +3469,123 @@ visibility: hidden !important;
           clickHandler: clickHandler,
         });
       }
+    }
+
+    /**
+     * Initializes a dedicated controller for a standalone /watch/<id> page.
+     * RedGIFs' watch view does not always contain .GifPreview/.tileItem; the
+     * media player can be rendered directly by React/Partytown. In that case
+     * the normal card observers have nothing reliable to attach to.
+     * @private
+     */
+    _initWatchPage() {
+      const match = window.location.pathname.match(/^\/watch\/([^/?#]+)/i);
+      if (!match?.[1]) return;
+
+      const mediaId = decodeURIComponent(match[1]).trim().toLowerCase();
+      if (!mediaId) return;
+
+      const findPlayer = () => {
+        const videos = [...document.querySelectorAll('video')].filter((v) => v instanceof HTMLVideoElement);
+        if (!videos.length) return null;
+
+        // Prefer the visible video with the largest rendered area.
+        let best = null;
+        let bestArea = 0;
+        for (const video of videos) {
+          if (!video.isConnected) continue;
+          const rect = video.getBoundingClientRect();
+          const area = Math.max(0, rect.width) * Math.max(0, rect.height);
+          const visible = rect.width > 0 && rect.height > 0 && rect.bottom > 0 && rect.right > 0 && rect.top < innerHeight && rect.left < innerWidth;
+          if (visible && area >= bestArea) {
+            best = video;
+            bestArea = area;
+          }
+        }
+        return best || videos[0];
+      };
+
+      const findHost = (video) => {
+        if (!(video instanceof HTMLVideoElement)) return null;
+        const preview = video.closest(CONSTANTS.VIDEO_CONTAINER_SELECTOR);
+        if (preview instanceof HTMLElement) return { type: 'element', element: preview };
+        return { type: 'floating', element: video };
+      };
+
+      const positionFloatingControls = (controls, video) => {
+        if (!controls.isConnected || !video.isConnected) return;
+        const rect = video.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) {
+          controls.style.display = 'none';
+          return;
+        }
+        controls.style.display = 'flex';
+        const left = Math.max(6, Math.min(innerWidth - controls.offsetWidth - 6, rect.right - controls.offsetWidth - 8));
+        const top = Math.max(6, Math.min(innerHeight - controls.offsetHeight - 6, rect.top + 8));
+        controls.style.left = `${Math.round(left)}px`;
+        controls.style.top = `${Math.round(top)}px`;
+      };
+
+      const attach = () => {
+        const video = findPlayer();
+        if (!video) return;
+
+        const host = findHost(video);
+        if (!host) return;
+
+        if (host.type === 'element') {
+          this._addButtonsToElement(host.element, mediaId, CONSTANTS.CONTEXT_TYPE.PREVIEW);
+          return;
+        }
+
+        let controls = document.querySelector(`.${CONSTANTS.WATCH_PAGE_CONTROLS}`);
+        if (!(controls instanceof HTMLElement)) {
+          controls = document.createElement('div');
+          controls.className = CONSTANTS.WATCH_PAGE_CONTROLS;
+          document.body.appendChild(controls);
+        }
+
+        // Re-rendering can replace the video element. Keep the currently active
+        // video reference on the controls so the position updater follows it.
+        controls.__rgvdbVideo = video;
+
+        this._addButtonsToElement(controls, mediaId, CONSTANTS.CONTEXT_TYPE.PREVIEW);
+        positionFloatingControls(controls, video);
+      };
+
+      const cleanupOrReattach = () => {
+        const controls = document.querySelector(`.${CONSTANTS.WATCH_PAGE_CONTROLS}`);
+        if (controls instanceof HTMLElement && controls.__rgvdbVideo instanceof HTMLVideoElement) {
+          if (!controls.__rgvdbVideo.isConnected) controls.remove();
+        }
+        attach();
+      };
+
+      // Initial player can appear well after DOMContentLoaded.
+      [0, 100, 350, 800, 1500, 3000, 5000].forEach((delay) => setTimeout(attach, delay));
+
+      const observer = new MutationObserver(() => {
+        if (this._watchScanScheduled) return;
+        this._watchScanScheduled = true;
+        requestAnimationFrame(() => {
+          this._watchScanScheduled = false;
+          cleanupOrReattach();
+        });
+      });
+      observer.observe(document.documentElement || document, {
+        childList: true,
+        subtree: true,
+      });
+
+      const reposition = () => {
+        const controls = document.querySelector(`.${CONSTANTS.WATCH_PAGE_CONTROLS}`);
+        if (controls instanceof HTMLElement && controls.__rgvdbVideo instanceof HTMLVideoElement) {
+          positionFloatingControls(controls, controls.__rgvdbVideo);
+        }
+      };
+      window.addEventListener('scroll', reposition, { passive: true });
+      window.addEventListener('resize', reposition, { passive: true });
+      document.addEventListener('fullscreenchange', () => setTimeout(attach, 50));
     }
 
     /**
